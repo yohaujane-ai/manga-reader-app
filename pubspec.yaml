@@ -12,17 +12,10 @@ dependencies:
   flutter:
     sdk: flutter
   
-  # PDF 渲染
   pdfx: ^2.6.0
-  
-  # 文件选择
   file_picker: ^6.1.1
-  
-  # 本地存储
   shared_preferences: ^2.2.2
   path_provider: ^2.1.1
-  
-  # 权限管理
   permission_handler: ^11.1.0
 
 dev_dependencies:
