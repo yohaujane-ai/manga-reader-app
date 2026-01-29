@@ -1,7 +1,10 @@
 import 'dart:io';
+import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:permission_handler/permission_handler.dart';
+import 'package:pdfx/pdfx.dart';
+import 'package:path_provider/path_provider.dart';
 import '../models/manga_book.dart';
 import '../services/storage_service.dart';
 import 'reader_screen.dart';
@@ -16,6 +19,9 @@ class BookshelfScreen extends StatefulWidget {
 class _BookshelfScreenState extends State<BookshelfScreen> {
   List<MangaBook> books = [];
   bool isLoading = true;
+  
+  // 封面缓存
+  final Map<String, Uint8List> _coverCache = {};
 
   @override
   void initState() {
@@ -45,6 +51,55 @@ class _BookshelfScreenState extends State<BookshelfScreen> {
     // 如果有变化，保存
     if (validBooks.length != loadedBooks.length) {
       await StorageService.saveBooks(validBooks);
+    }
+    
+    // 加载封面
+    _loadCovers();
+  }
+
+  Future<void> _loadCovers() async {
+    for (final book in books) {
+      if (!_coverCache.containsKey(book.path)) {
+        final cover = await _getCover(book.path);
+        if (cover != null && mounted) {
+          setState(() {
+            _coverCache[book.path] = cover;
+          });
+        }
+      }
+    }
+  }
+
+  Future<Uint8List?> _getCover(String pdfPath) async {
+    try {
+      // 先检查缓存文件
+      final cacheDir = await getApplicationDocumentsDirectory();
+      final fileName = pdfPath.hashCode.toString();
+      final cacheFile = File('${cacheDir.path}/covers/$fileName.jpg');
+      
+      if (await cacheFile.exists()) {
+        return await cacheFile.readAsBytes();
+      }
+      
+      // 生成封面
+      final document = await PdfDocument.openFile(pdfPath);
+      final page = await document.getPage(1);
+      final image = await page.render(
+        width: page.width * 0.5,
+        height: page.height * 0.5,
+        format: PdfPageImageFormat.jpeg,
+        quality: 80,
+      );
+      await page.close();
+      await document.close();
+      
+      // 保存到缓存
+      await cacheFile.parent.create(recursive: true);
+      await cacheFile.writeAsBytes(image!.bytes);
+      
+      return image.bytes;
+    } catch (e) {
+      return null;
     }
   }
 
@@ -83,6 +138,15 @@ class _BookshelfScreenState extends State<BookshelfScreen> {
           books.insert(0, newBook);
         });
         await StorageService.saveBooks(books);
+        
+        // 加载封面
+        final cover = await _getCover(path);
+        if (cover != null && mounted) {
+          setState(() {
+            _coverCache[path] = cover;
+          });
+        }
+        
         _openBook(newBook);
       }
     }
@@ -115,6 +179,7 @@ class _BookshelfScreenState extends State<BookshelfScreen> {
               Navigator.pop(context);
               setState(() {
                 books.remove(book);
+                _coverCache.remove(book.path);
               });
               await StorageService.saveBooks(books);
             },
@@ -143,7 +208,7 @@ class _BookshelfScreenState extends State<BookshelfScreen> {
           ? const Center(child: CircularProgressIndicator())
           : books.isEmpty
               ? _buildEmptyState()
-              : _buildBookList(),
+              : _buildBookGrid(),
       floatingActionButton: FloatingActionButton.extended(
         onPressed: _pickFile,
         icon: const Icon(Icons.folder_open),
@@ -170,40 +235,110 @@ class _BookshelfScreenState extends State<BookshelfScreen> {
     );
   }
 
-  Widget _buildBookList() {
-    return ListView.builder(
+  Widget _buildBookGrid() {
+    return GridView.builder(
       padding: const EdgeInsets.all(12),
+      gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+        crossAxisCount: 3,
+        childAspectRatio: 0.55,
+        crossAxisSpacing: 12,
+        mainAxisSpacing: 12,
+      ),
       itemCount: books.length,
       itemBuilder: (context, index) {
         final book = books[index];
+        final cover = _coverCache[book.path];
         final progress = book.totalPages > 0 
-            ? '${book.currentPage + 1} / ${book.totalPages}'
-            : '未读';
+            ? '${book.currentPage + 1}/${book.totalPages}'
+            : '';
         
-        return Card(
-          color: const Color(0xFF2a2a2a),
-          margin: const EdgeInsets.only(bottom: 8),
-          child: ListTile(
-            leading: Container(
-              width: 50,
-              height: 70,
-              decoration: BoxDecoration(
-                color: Colors.grey[800],
-                borderRadius: BorderRadius.circular(4),
+        return GestureDetector(
+          onTap: () => _openBook(book),
+          onLongPress: () => _deleteBook(book),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              // 封面
+              Expanded(
+                child: Container(
+                  decoration: BoxDecoration(
+                    color: Colors.grey[850],
+                    borderRadius: BorderRadius.circular(8),
+                    boxShadow: [
+                      BoxShadow(
+                        color: Colors.black.withOpacity(0.3),
+                        blurRadius: 5,
+                        offset: const Offset(2, 2),
+                      ),
+                    ],
+                  ),
+                  clipBehavior: Clip.antiAlias,
+                  child: Stack(
+                    fit: StackFit.expand,
+                    children: [
+                      // 封面图片
+                      if (cover != null)
+                        Image.memory(
+                          cover,
+                          fit: BoxFit.cover,
+                        )
+                      else
+                        Container(
+                          color: Colors.grey[800],
+                          child: const Center(
+                            child: Icon(Icons.book, 
+                                size: 40, color: Colors.white30),
+                          ),
+                        ),
+                      
+                      // 进度标签
+                      if (progress.isNotEmpty)
+                        Positioned(
+                          bottom: 0,
+                          left: 0,
+                          right: 0,
+                          child: Container(
+                            padding: const EdgeInsets.symmetric(
+                                vertical: 4, horizontal: 6),
+                            decoration: BoxDecoration(
+                              gradient: LinearGradient(
+                                begin: Alignment.bottomCenter,
+                                end: Alignment.topCenter,
+                                colors: [
+                                  Colors.black.withOpacity(0.8),
+                                  Colors.transparent,
+                                ],
+                              ),
+                            ),
+                            child: Text(
+                              progress,
+                              style: const TextStyle(
+                                color: Colors.white,
+                                fontSize: 11,
+                              ),
+                              textAlign: TextAlign.center,
+                            ),
+                          ),
+                        ),
+                    ],
+                  ),
+                ),
               ),
-              child: const Icon(Icons.book, color: Colors.white54),
-            ),
-            title: Text(book.name, 
-                style: const TextStyle(color: Colors.white),
+              
+              const SizedBox(height: 6),
+              
+              // 书名
+              Text(
+                book.name,
+                style: const TextStyle(
+                  color: Colors.white,
+                  fontSize: 12,
+                ),
                 maxLines: 2,
-                overflow: TextOverflow.ellipsis),
-            subtitle: Text(progress,
-                style: TextStyle(color: Colors.grey[500])),
-            trailing: IconButton(
-              icon: const Icon(Icons.delete_outline, color: Colors.grey),
-              onPressed: () => _deleteBook(book),
-            ),
-            onTap: () => _openBook(book),
+                overflow: TextOverflow.ellipsis,
+                textAlign: TextAlign.center,
+              ),
+            ],
           ),
         );
       },
