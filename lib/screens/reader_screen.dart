@@ -267,9 +267,9 @@ class _ReaderScreenState extends State<ReaderScreen> {
                   onTapUp: _handleTap,
                   onHorizontalDragEnd: (details) {
                     if (details.primaryVelocity! > 0) {
-                      _prevPage(); // 向右滑：上一页
+                      _nextPage(); // 从左往右拖：下一页
                     } else if (details.primaryVelocity! < 0) {
-                      _nextPage(); // 向左滑：下一页
+                      _prevPage(); // 从右往左拖：上一页
                     }
                   },
                   child: Container(
