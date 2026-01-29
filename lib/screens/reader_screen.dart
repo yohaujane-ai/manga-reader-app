@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:math' as math;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:pdfx/pdfx.dart';
@@ -14,14 +15,21 @@ class ReaderScreen extends StatefulWidget {
   State<ReaderScreen> createState() => _ReaderScreenState();
 }
 
-class _ReaderScreenState extends State<ReaderScreen> {
+class _ReaderScreenState extends State<ReaderScreen> with SingleTickerProviderStateMixin {
   PdfDocument? _document;
   int _currentPage = 0;
   int _totalPages = 0;
   bool _isLoading = true;
   bool _showControls = false;
   bool _dualPage = true;
+  int _pageOffset = 0; // 跨页偏移：0=正常(1-2,3-4), 1=偏移(1单独,2-3,4-5)
   Timer? _hideTimer;
+  
+  // 翻页动画
+  late AnimationController _pageAnimController;
+  Animation<double>? _pageAnimation;
+  bool _isAnimating = false;
+  bool _animatingForward = true; // true=下一页, false=上一页
   
   // 页面图片缓存
   final Map<int, PdfPageImage?> _pageCache = {};
@@ -29,10 +37,25 @@ class _ReaderScreenState extends State<ReaderScreen> {
   // 当前显示的图片
   PdfPageImage? _leftPageImage;
   PdfPageImage? _rightPageImage;
+  
+  // 动画前的图片（用于翻页效果）
+  PdfPageImage? _prevLeftImage;
+  PdfPageImage? _prevRightImage;
 
   @override
   void initState() {
     super.initState();
+    _pageAnimController = AnimationController(
+      duration: const Duration(milliseconds: 300),
+      vsync: this,
+    );
+    _pageAnimController.addStatusListener((status) {
+      if (status == AnimationStatus.completed) {
+        setState(() {
+          _isAnimating = false;
+        });
+      }
+    });
     _loadSettings();
     _loadPdf();
     _enterFullScreen();
@@ -41,6 +64,7 @@ class _ReaderScreenState extends State<ReaderScreen> {
   @override
   void dispose() {
     _hideTimer?.cancel();
+    _pageAnimController.dispose();
     _document?.close();
     _exitFullScreen();
     super.dispose();
@@ -58,6 +82,7 @@ class _ReaderScreenState extends State<ReaderScreen> {
     final settings = await StorageService.loadSettings();
     setState(() {
       _dualPage = settings['dualPage'] ?? true;
+      _pageOffset = settings['pageOffset'] ?? 0;
     });
   }
 
@@ -133,27 +158,67 @@ class _ReaderScreenState extends State<ReaderScreen> {
     }
   }
 
+  // 根据跨页设置计算实际显示的页码
+  List<int> _getDisplayPages(int basePage) {
+    if (!_dualPage) {
+      return [basePage];
+    }
+    
+    // 考虑跨页偏移
+    int adjustedPage = basePage;
+    
+    if (_pageOffset == 1) {
+      // 偏移模式：第一页单独，之后成对
+      if (basePage == 0) {
+        return [0]; // 第一页单独显示
+      }
+      // 确保从偏移后的偶数页开始
+      adjustedPage = basePage;
+      if ((adjustedPage - 1) % 2 == 1) {
+        adjustedPage -= 1;
+      }
+    } else {
+      // 正常模式：0-1, 2-3, 4-5...
+      if (basePage % 2 == 1) {
+        adjustedPage = basePage - 1;
+      }
+    }
+    
+    List<int> pages = [adjustedPage];
+    if (adjustedPage + 1 < _totalPages) {
+      if (_pageOffset == 1 && adjustedPage == 0) {
+        // 偏移模式第一页不加第二页
+      } else {
+        pages.add(adjustedPage + 1);
+      }
+    }
+    
+    return pages;
+  }
+
   Future<void> _renderCurrentPages() async {
     if (_document == null) return;
     
-    if (_dualPage) {
-      // 双页模式：右边当前页，左边下一页
-      final rightImage = await _getPageImage(_currentPage);
-      final leftImage = await _getPageImage(_currentPage + 1);
+    List<int> displayPages = _getDisplayPages(_currentPage);
+    
+    if (displayPages.length == 1) {
+      // 单页模式或偏移模式的第一页
+      final image = await _getPageImage(displayPages[0]);
+      if (mounted) {
+        setState(() {
+          _rightPageImage = image;
+          _leftPageImage = null;
+        });
+      }
+    } else {
+      // 双页模式：右边是当前页，左边是下一页
+      final rightImage = await _getPageImage(displayPages[0]);
+      final leftImage = await _getPageImage(displayPages[1]);
       
       if (mounted) {
         setState(() {
           _rightPageImage = rightImage;
           _leftPageImage = leftImage;
-        });
-      }
-    } else {
-      // 单页模式
-      final image = await _getPageImage(_currentPage);
-      if (mounted) {
-        setState(() {
-          _rightPageImage = image;
-          _leftPageImage = null;
         });
       }
     }
@@ -173,29 +238,88 @@ class _ReaderScreenState extends State<ReaderScreen> {
   }
 
   void _nextPage() {
-    final step = _dualPage ? 2 : 1;
+    if (_isAnimating) return;
+    
+    int step;
+    if (!_dualPage) {
+      step = 1;
+    } else if (_pageOffset == 1 && _currentPage == 0) {
+      step = 1; // 偏移模式第一页只跳1页
+    } else {
+      step = 2;
+    }
+    
     if (_currentPage + step < _totalPages) {
+      // 保存当前图片用于动画
+      _prevLeftImage = _leftPageImage;
+      _prevRightImage = _rightPageImage;
+      
       setState(() {
+        _isAnimating = true;
+        _animatingForward = true;
         _currentPage += step;
       });
+      
+      _pageAnimController.reset();
+      _pageAnimation = Tween<double>(begin: 0.0, end: 1.0).animate(
+        CurvedAnimation(parent: _pageAnimController, curve: Curves.easeInOut)
+      );
+      _pageAnimController.forward();
+      
       _saveProgress();
       _renderCurrentPages();
     }
   }
 
   void _prevPage() {
-    final step = _dualPage ? 2 : 1;
+    if (_isAnimating) return;
+    
+    int step;
+    if (!_dualPage) {
+      step = 1;
+    } else if (_pageOffset == 1 && _currentPage <= 2) {
+      step = _currentPage == 1 ? 1 : (_currentPage > 0 ? _currentPage : 0);
+    } else {
+      step = 2;
+    }
+    
     if (_currentPage - step >= 0) {
+      _prevLeftImage = _leftPageImage;
+      _prevRightImage = _rightPageImage;
+      
       setState(() {
+        _isAnimating = true;
+        _animatingForward = false;
         _currentPage -= step;
       });
-    } else {
+      
+      _pageAnimController.reset();
+      _pageAnimation = Tween<double>(begin: 0.0, end: 1.0).animate(
+        CurvedAnimation(parent: _pageAnimController, curve: Curves.easeInOut)
+      );
+      _pageAnimController.forward();
+      
+      _saveProgress();
+      _renderCurrentPages();
+    } else if (_currentPage > 0) {
+      _prevLeftImage = _leftPageImage;
+      _prevRightImage = _rightPageImage;
+      
       setState(() {
+        _isAnimating = true;
+        _animatingForward = false;
         _currentPage = 0;
       });
+      
+      _pageAnimController.reset();
+      _pageAnimation = Tween<double>(begin: 0.0, end: 1.0).animate(
+        CurvedAnimation(parent: _pageAnimController, curve: Curves.easeInOut)
+      );
+      _pageAnimController.forward();
+      
+      _saveProgress();
+      _renderCurrentPages();
     }
-    _saveProgress();
-    _renderCurrentPages();
   }
 
   void _goToPage(int page) {
@@ -234,7 +358,15 @@ class _ReaderScreenState extends State<ReaderScreen> {
     setState(() {
       _dualPage = !_dualPage;
     });
-    StorageService.saveSettings({'dualPage': _dualPage});
+    StorageService.saveSettings({'dualPage': _dualPage, 'pageOffset': _pageOffset});
+    _renderCurrentPages();
+  }
+
+  void _togglePageOffset() {
+    setState(() {
+      _pageOffset = (_pageOffset + 1) % 2;
+    });
+    StorageService.saveSettings({'dualPage': _dualPage, 'pageOffset': _pageOffset});
     _renderCurrentPages();
   }
 
@@ -288,6 +420,19 @@ class _ReaderScreenState extends State<ReaderScreen> {
   }
 
   Widget _buildPageView() {
+    if (_isAnimating && _pageAnimation != null) {
+      return AnimatedBuilder(
+        animation: _pageAnimation!,
+        builder: (context, child) {
+          return _buildAnimatedPage(_pageAnimation!.value);
+        },
+      );
+    }
+    
+    return _buildStaticPage();
+  }
+
+  Widget _buildStaticPage() {
     if (_dualPage && _leftPageImage != null && _rightPageImage != null) {
       // 双页模式
       return Row(
@@ -310,6 +455,101 @@ class _ReaderScreenState extends State<ReaderScreen> {
     } else {
       return const Center(
         child: Text('加载中...', style: TextStyle(color: Colors.white54)),
+      );
+    }
+  }
+
+  Widget _buildAnimatedPage(double value) {
+    // 翻书动画效果
+    if (_animatingForward) {
+      // 向前翻页（下一页）- 从右向左翻
+      return Stack(
+        children: [
+          // 新页面（目标页）
+          _buildStaticPage(),
+          // 旧页面（翻走的页）
+          if (_prevRightImage != null)
+            Positioned.fill(
+              child: ClipRect(
+                child: Align(
+                  alignment: Alignment.centerRight,
+                  widthFactor: 1.0 - value,
+                  child: Transform(
+                    alignment: Alignment.centerRight,
+                    transform: Matrix4.identity()
+                      ..setEntry(3, 2, 0.001)
+                      ..rotateY(-value * math.pi / 2),
+                    child: Container(
+                      decoration: BoxDecoration(
+                        boxShadow: [
+                          BoxShadow(
+                            color: Colors.black.withOpacity(0.3 * (1 - value)),
+                            blurRadius: 10,
+                            offset: const Offset(-5, 0),
+                          ),
+                        ],
+                      ),
+                      child: _dualPage && _prevLeftImage != null
+                          ? Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                Flexible(child: _buildPageImage(_prevLeftImage)),
+                                const SizedBox(width: 2),
+                                Flexible(child: _buildPageImage(_prevRightImage)),
+                              ],
+                            )
+                          : _buildPageImage(_prevRightImage),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+        ],
+      );
+    } else {
+      // 向后翻页（上一页）- 从左向右翻
+      return Stack(
+        children: [
+          // 新页面（目标页）
+          _buildStaticPage(),
+          // 旧页面（翻走的页）
+          if (_prevRightImage != null)
+            Positioned.fill(
+              child: ClipRect(
+                child: Align(
+                  alignment: Alignment.centerLeft,
+                  widthFactor: 1.0 - value,
+                  child: Transform(
+                    alignment: Alignment.centerLeft,
+                    transform: Matrix4.identity()
+                      ..setEntry(3, 2, 0.001)
+                      ..rotateY(value * math.pi / 2),
+                    child: Container(
+                      decoration: BoxDecoration(
+                        boxShadow: [
+                          BoxShadow(
+                            color: Colors.black.withOpacity(0.3 * (1 - value)),
+                            blurRadius: 10,
+                            offset: const Offset(5, 0),
+                          ),
+                        ],
+                      ),
+                      child: _dualPage && _prevLeftImage != null
+                          ? Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                Flexible(child: _buildPageImage(_prevLeftImage)),
+                                const SizedBox(width: 2),
+                                Flexible(child: _buildPageImage(_prevRightImage)),
+                              ],
+                            )
+                          : _buildPageImage(_prevRightImage),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+        ],
       );
     }
   }
@@ -366,6 +606,23 @@ class _ReaderScreenState extends State<ReaderScreen> {
                       overflow: TextOverflow.ellipsis,
                     ),
                   ),
+                  
+                  // 跨页设置按钮（仅双页模式显示）
+                  if (_dualPage)
+                    TextButton.icon(
+                      onPressed: _togglePageOffset,
+                      icon: Icon(
+                        Icons.swap_horiz,
+                        color: _pageOffset == 1 ? Colors.orange : Colors.white,
+                      ),
+                      label: Text(
+                        _pageOffset == 0 ? '跨页:标准' : '跨页:偏移',
+                        style: TextStyle(
+                          color: _pageOffset == 1 ? Colors.orange : Colors.white,
+                          fontSize: 12,
+                        ),
+                      ),
+                    ),
                   
                   // 双页切换按钮
                   TextButton.icon(
